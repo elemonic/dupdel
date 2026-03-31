@@ -134,8 +134,8 @@ sub parse_depth_arg {
     my ($value, $opt_name) = @_;
 
     die "エラー: $opt_name の値がありません\n" unless defined $value;
-    die "エラー: $opt_name には 1 以上の整数を指定してください\n"
-        unless $value =~ /\A[1-9]\d*\z/;
+    die "エラー: $opt_name には 0 以上の整数を指定してください\n"
+        unless $value =~ /\A\d+\z/;
 
     return int($value);
 }
@@ -154,7 +154,9 @@ sub usage {
   --delete を付けない場合は dry-run です（削除しません）。
   指定フォルダ直下の通常ファイルのみを対象に、重複ファイルを検出します。
   -d N はちょうど N 階層下の各フォルダを独立に処理します。
+       N=0 のときは葉フォルダのみを処理します。
   -D N は 1 階層下から N 階層下までの各フォルダを独立に処理します。
+       N=0 のときはすべてのサブフォルダを処理します。
   -s を付けると基準フォルダ自身も処理対象に含めます。
 USAGE
 }
@@ -299,6 +301,20 @@ sub collect_target_dirs {
         return ($base_dir);
     }
 
+    if (defined $opt->{exact_depth} && $opt->{exact_depth} == 0) {
+        my @dirs;
+        push @dirs, $base_dir if $opt->{include_self};
+        push @dirs, collect_leaf_subdirs($base_dir);
+        return @dirs;
+    }
+
+    if (defined $opt->{max_depth} && $opt->{max_depth} == 0) {
+        my @dirs;
+        push @dirs, $base_dir if $opt->{include_self};
+        push @dirs, collect_all_subdirs($base_dir);
+        return @dirs;
+    }
+
     my $min_depth = defined $opt->{exact_depth} ? $opt->{exact_depth} : 1;
     my $max_depth = defined $opt->{exact_depth} ? $opt->{exact_depth} : $opt->{max_depth};
 
@@ -315,6 +331,45 @@ sub collect_subdirs_in_range {
     my @out;
     _collect_subdirs_in_range($dir, 1, $min_depth, $max_depth, \@out);
     return @out;
+}
+
+sub collect_all_subdirs {
+    my ($dir) = @_;
+
+    my @out;
+    _collect_all_subdirs($dir, \@out);
+    return @out;
+}
+
+sub _collect_all_subdirs {
+    my ($dir, $out) = @_;
+
+    for my $subdir (collect_subdirs($dir)) {
+        push @$out, $subdir;
+        _collect_all_subdirs($subdir, $out);
+    }
+}
+
+sub collect_leaf_subdirs {
+    my ($dir) = @_;
+
+    my @out;
+    _collect_leaf_subdirs($dir, \@out);
+    return @out;
+}
+
+sub _collect_leaf_subdirs {
+    my ($dir, $out) = @_;
+
+    for my $subdir (collect_subdirs($dir)) {
+        my @children = collect_subdirs($subdir);
+        if (@children) {
+            _collect_leaf_subdirs($subdir, $out);
+        }
+        else {
+            push @$out, $subdir;
+        }
+    }
 }
 
 sub _collect_subdirs_in_range {
@@ -525,12 +580,22 @@ sub target_mode_label {
     my ($opt) = @_;
 
     if (defined $opt->{exact_depth}) {
+        if ($opt->{exact_depth} == 0) {
+            return $opt->{include_self}
+                ? "基準 + 葉フォルダのみ"
+                : "葉フォルダのみ";
+        }
         return $opt->{include_self}
             ? "基準 + ちょうど $opt->{exact_depth} 階層下"
             : "ちょうど $opt->{exact_depth} 階層下";
     }
 
     if (defined $opt->{max_depth}) {
+        if ($opt->{max_depth} == 0) {
+            return $opt->{include_self}
+                ? "基準 + 全サブフォルダ"
+                : "全サブフォルダ";
+        }
         return $opt->{include_self}
             ? "基準 + 1..$opt->{max_depth} 階層下"
             : "1..$opt->{max_depth} 階層下";
