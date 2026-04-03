@@ -41,6 +41,7 @@ sub main {
     print_cp932("基準フォルダ   : $opt->{target_dir}\n");
     print_cp932("処理単位       : " . target_mode_label($opt) . "\n");
     print_cp932("処理対象数     : " . scalar(@target_dirs) . "\n");
+    print_cp932("keep選択       : " . keep_rule_label($opt) . "\n");
     print_cp932("OS判定         : " . ($IS_WINDOWS ? "Windows" : "非Windows") . "\n");
     if ($IS_WINDOWS) {
         print_cp932("列挙方式       : " . ($USE_LONGPATH ? "Win32::LongPath" : "標準") . "\n");
@@ -56,7 +57,8 @@ sub main {
         log_utf8($log_fh, "===== " . timestamp_for_log() . " START =====\n");
         log_utf8($log_fh, "BASE_DIR: $opt->{target_dir}\n");
         log_utf8($log_fh, "MODE: " . target_mode_label($opt) . "\n");
-        log_utf8($log_fh, "TARGET_COUNT: " . scalar(@target_dirs) . "\n\n");
+        log_utf8($log_fh, "TARGET_COUNT: " . scalar(@target_dirs) . "\n");
+        log_utf8($log_fh, "KEEP_RULE: " . keep_rule_label($opt) . "\n\n");
     }
 
     my $result = process_target_dirs(\@target_dirs, $opt, $log_fh);
@@ -90,6 +92,7 @@ sub parse_args {
     my %opt = (
         do_delete    => 0,
         include_self => 0,
+        reverse_keep => 0,
     );
 
     while (@args) {
@@ -100,6 +103,13 @@ sub parse_args {
         }
         elsif ($arg eq '-s') {
             $opt{include_self} = 1;
+        }
+        elsif ($arg eq '-r') {
+            $opt{reverse_keep} = 1;
+        }
+        elsif ($arg eq '-p') {
+            die usage() unless @args;
+            $opt{priority_delete} = shift @args;
         }
         elsif ($arg eq '-d') {
             die usage() unless @args;
@@ -147,6 +157,9 @@ sub usage {
   perl dupdel.pl --delete 対象フォルダ
   perl dupdel.pl -d N 対象フォルダ
   perl dupdel.pl -D N 対象フォルダ
+  perl dupdel.pl -p STRING 対象フォルダ
+  perl dupdel.pl -r 対象フォルダ
+  perl dupdel.pl -p STRING -r 対象フォルダ
   perl dupdel.pl -d N -s 対象フォルダ
   perl dupdel.pl -D N -s 対象フォルダ
 
@@ -158,6 +171,8 @@ sub usage {
   -D N は 1 階層下から N 階層下までの各フォルダを独立に処理します。
        N=0 のときはすべてのサブフォルダを処理します。
   -s を付けると基準フォルダ自身も処理対象に含めます。
+  -p STRING を付けると STRING を含むファイルを削除側へ寄せます。
+  -r を付けるとファイル名の逆順で keep を決めます。
 USAGE
 }
 
@@ -174,7 +189,7 @@ sub process_target_dirs {
     }
 
     for my $dir (@$target_dirs) {
-        my $result = process_duplicates_in_dir($dir, $opt->{do_delete}, $log_fh, $show_dir_header);
+        my $result = process_duplicates_in_dir($dir, $opt, $log_fh, $show_dir_header);
 
         $overall->{processed_dirs}++;
         $overall->{total_files}        += $result->{total_files};
@@ -189,7 +204,8 @@ sub process_target_dirs {
 }
 
 sub process_duplicates_in_dir {
-    my ($dir, $do_delete, $log_fh, $show_dir_header) = @_;
+    my ($dir, $opt, $log_fh, $show_dir_header) = @_;
+    my $do_delete = $opt->{do_delete};
 
     my $result = empty_result();
     my @files = collect_files($dir);
@@ -230,7 +246,7 @@ sub process_duplicates_in_dir {
             my $dups = $by_sha1{$sha1};
             next if @$dups < 2;
 
-            my @sorted = sort { $a->{name} cmp $b->{name} } @$dups;
+            my @sorted = sort_duplicate_group($dups, $opt);
             my $keep = shift @sorted;
 
             push @dup_groups, {
@@ -323,6 +339,34 @@ sub collect_target_dirs {
     push @dirs, collect_subdirs_in_range($base_dir, $min_depth, $max_depth);
 
     return @dirs;
+}
+
+sub sort_duplicate_group {
+    my ($dups, $opt) = @_;
+
+    return sort {
+        my $prio_cmp = priority_delete_rank($a->{name}, $opt)
+            <=> priority_delete_rank($b->{name}, $opt);
+        return $prio_cmp if $prio_cmp != 0;
+
+        return $opt->{reverse_keep}
+            ? ($b->{name} cmp $a->{name})
+            : ($a->{name} cmp $b->{name});
+    } @$dups;
+}
+
+sub priority_delete_rank {
+    my ($name, $opt) = @_;
+
+    return 0 unless defined $opt->{priority_delete};
+    return file_matches_priority_delete($name, $opt->{priority_delete}) ? 1 : 0;
+}
+
+sub file_matches_priority_delete {
+    my ($name, $needle) = @_;
+
+    return 0 unless defined $needle;
+    return index($name, $needle) >= 0 ? 1 : 0;
 }
 
 sub collect_subdirs_in_range {
@@ -602,6 +646,15 @@ sub target_mode_label {
     }
 
     return "基準フォルダ直下のみ";
+}
+
+sub keep_rule_label {
+    my ($opt) = @_;
+
+    my $order = $opt->{reverse_keep} ? '逆順' : '通常順';
+    return defined $opt->{priority_delete}
+        ? "$order / 優先削除='$opt->{priority_delete}'"
+        : $order;
 }
 
 sub make_log_filename {
