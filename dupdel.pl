@@ -64,6 +64,7 @@ sub main {
     my $result = process_target_dirs(\@target_dirs, $opt, $log_fh);
 
     if ($opt->{do_delete}) {
+        log_delete_failures_summary($log_fh, $result->{delete_failures});
         log_utf8($log_fh, "合計件数: フォルダ=$result->{processed_dirs} / 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count}\n");
         log_utf8($log_fh, "===== " . timestamp_for_log() . " END =====\n");
         close $log_fh;
@@ -198,6 +199,7 @@ sub process_target_dirs {
         $overall->{deleted_count}      += $result->{deleted_count};
         $overall->{delete_error_count} += $result->{delete_error_count};
         $overall->{hash_error_count}   += $result->{hash_error_count};
+        push @{ $overall->{delete_failures} }, @{ $result->{delete_failures} };
     }
 
     return $overall;
@@ -293,9 +295,18 @@ sub process_duplicates_in_dir {
                     log_utf8($log_fh, "-> $del->{name}\n");
                 }
                 else {
+                    my $error_message = $!;
+                    my $failed_at = timestamp_for_log();
                     $result->{delete_error_count}++;
-                    warn_cp932("削除失敗: $del->{name} : $!\n");
-                    log_utf8($log_fh, "-> $del->{name} [削除失敗: $!]\n");
+                    push @{ $result->{delete_failures} }, {
+                        target_dir => $dir,
+                        keep_name  => $keep->{name},
+                        delete_name => $del->{name},
+                        error      => $error_message,
+                        failed_at  => $failed_at,
+                    };
+                    warn_cp932("削除失敗: keep=$keep->{name} / delete=$del->{name} : $error_message\n");
+                    log_utf8($log_fh, "-> $del->{name} [削除失敗: $error_message]\n");
                 }
             }
 
@@ -592,7 +603,27 @@ sub empty_result {
         deleted_count       => 0,
         delete_error_count  => 0,
         hash_error_count    => 0,
+        delete_failures     => [],
     };
+}
+
+sub log_delete_failures_summary {
+    my ($log_fh, $delete_failures) = @_;
+
+    return unless $log_fh;
+    return unless $delete_failures && @$delete_failures;
+
+    log_utf8($log_fh, "削除失敗一覧:\n");
+
+    for my $failure (@$delete_failures) {
+        log_utf8($log_fh, "- TARGET_DIR: $failure->{target_dir}\n");
+        log_utf8($log_fh, "  KEEP: $failure->{keep_name}\n");
+        log_utf8($log_fh, "  DELETE: $failure->{delete_name}\n");
+        log_utf8($log_fh, "  ERROR: $failure->{error}\n");
+        log_utf8($log_fh, "  TIME: $failure->{failed_at}\n");
+    }
+
+    log_utf8($log_fh, "\n");
 }
 
 sub open_log_file {
