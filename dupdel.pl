@@ -42,6 +42,7 @@ sub main {
     print_cp932("処理単位       : " . target_mode_label($opt) . "\n");
     print_cp932("処理対象数     : " . scalar(@target_dirs) . "\n");
     print_cp932("keep選択       : " . keep_rule_label($opt) . "\n");
+    print_cp932("削除除外       : " . exclude_rule_label($opt) . "\n");
     print_cp932("OS判定         : " . ($IS_WINDOWS ? "Windows" : "非Windows") . "\n");
     if ($IS_WINDOWS) {
         print_cp932("列挙方式       : " . ($USE_LONGPATH ? "Win32::LongPath" : "標準") . "\n");
@@ -58,7 +59,8 @@ sub main {
         log_utf8($log_fh, "BASE_DIR: $opt->{target_dir}\n");
         log_utf8($log_fh, "MODE: " . target_mode_label($opt) . "\n");
         log_utf8($log_fh, "TARGET_COUNT: " . scalar(@target_dirs) . "\n");
-        log_utf8($log_fh, "KEEP_RULE: " . keep_rule_label($opt) . "\n\n");
+        log_utf8($log_fh, "KEEP_RULE: " . keep_rule_label($opt) . "\n");
+        log_utf8($log_fh, "EXCLUDE_RULE: " . exclude_rule_label($opt) . "\n\n");
     }
 
     my $result = process_target_dirs(\@target_dirs, $opt, $log_fh);
@@ -112,6 +114,10 @@ sub parse_args {
             die usage() unless @args;
             $opt{priority_delete} = shift @args;
         }
+        elsif ($arg eq '-e') {
+            die usage() unless @args;
+            $opt{exclude_regex_text} = shift @args;
+        }
         elsif ($arg eq '-d') {
             die usage() unless @args;
             die "エラー: -d と -D は同時に指定できません\n" if defined $opt{max_depth};
@@ -132,6 +138,10 @@ sub parse_args {
 
     die usage() unless defined $opt{target_dir};
 
+    if (defined $opt{exclude_regex_text}) {
+        $opt{exclude_regex} = compile_exclude_regex($opt{exclude_regex_text});
+    }
+
     my $exists = ($IS_WINDOWS && $USE_LONGPATH)
         ? testL('d', $opt{target_dir})
         : -d $opt{target_dir};
@@ -139,6 +149,18 @@ sub parse_args {
     die "エラー: フォルダが見つかりません: $opt{target_dir}\n" unless $exists;
 
     return \%opt;
+}
+
+sub compile_exclude_regex {
+    my ($pattern) = @_;
+
+    die "エラー: -e の正規表現が空です\n"
+        unless defined $pattern && length $pattern;
+
+    my $regex = eval { qr/$pattern/ };
+    die "エラー: -e の正規表現が不正です: $@\n" if $@;
+
+    return $regex;
 }
 
 sub parse_depth_arg {
@@ -159,8 +181,10 @@ sub usage {
   perl dupdel.pl -d N 対象フォルダ
   perl dupdel.pl -D N 対象フォルダ
   perl dupdel.pl -p STRING 対象フォルダ
+  perl dupdel.pl -e REGEX 対象フォルダ
   perl dupdel.pl -r 対象フォルダ
   perl dupdel.pl -p STRING -r 対象フォルダ
+  perl dupdel.pl -e REGEX -p STRING -r 対象フォルダ
   perl dupdel.pl -d N -s 対象フォルダ
   perl dupdel.pl -D N -s 対象フォルダ
 
@@ -173,6 +197,9 @@ sub usage {
        N=0 のときはすべてのサブフォルダを処理します。
   -s を付けると基準フォルダ自身も処理対象に含めます。
   -p STRING を付けると STRING を含むファイルを削除側へ寄せます。
+  -e REGEX を付けるとファイル名が REGEX にマッチするファイルを削除候補から除外します。
+       REGEX はフルパスではなくファイル名だけに対して判定します。
+       除外にマッチしたファイルは重複していても削除しません。
   -r を付けるとファイル名の逆順で keep を決めます。
 USAGE
 }
@@ -248,13 +275,7 @@ sub process_duplicates_in_dir {
             my $dups = $by_sha1{$sha1};
             next if @$dups < 2;
 
-            my @sorted = sort_duplicate_group($dups, $opt);
-            my $keep = shift @sorted;
-
-            push @dup_groups, {
-                keep => $keep,
-                dels => [ @sorted ],
-            };
+            push @dup_groups, build_duplicate_group($dups, $opt);
         }
     }
 
@@ -274,18 +295,32 @@ sub process_duplicates_in_dir {
     for my $group (@dup_groups) {
         my $keep = $group->{keep};
         my @sorted = @{ $group->{dels} };
+        my @excluded = @{ $group->{excluded} };
 
         $result->{duplicate_groups}++;
         $result->{delete_candidates} += scalar @sorted;
 
-        print_cp932("$keep->{name}\n");
+        if ($group->{keep_is_excluded}) {
+            print_cp932("除外: $keep->{name}\n");
+        }
+        else {
+            print_cp932("$keep->{name}\n");
+        }
         for my $del (@sorted) {
             print_cp932("-> $del->{name}\n");
+        }
+        for my $excluded (@excluded) {
+            print_cp932("除外: $excluded->{name}\n");
         }
         print_cp932("\n");
 
         if ($do_delete) {
-            log_utf8($log_fh, "$keep->{name}\n");
+            if ($group->{keep_is_excluded}) {
+                log_utf8($log_fh, "除外: $keep->{name}\n");
+            }
+            else {
+                log_utf8($log_fh, "$keep->{name}\n");
+            }
 
             for my $del (@sorted) {
                 my $ok = delete_file($del->{path});
@@ -308,6 +343,10 @@ sub process_duplicates_in_dir {
                     warn_cp932("削除失敗: keep=$keep->{name} / delete=$del->{name} : $error_message\n");
                     log_utf8($log_fh, "-> $del->{name} [削除失敗: $error_message]\n");
                 }
+            }
+
+            for my $excluded (@excluded) {
+                log_utf8($log_fh, "除外: $excluded->{name}\n");
             }
 
             log_utf8($log_fh, "\n");
@@ -366,11 +405,41 @@ sub sort_duplicate_group {
     } @$dups;
 }
 
+sub build_duplicate_group {
+    my ($dups, $opt) = @_;
+
+    my @excluded = sort_duplicate_group(
+        [ grep { file_matches_exclude_regex($_->{name}, $opt) } @$dups ],
+        $opt,
+    );
+    my @eligible = sort_duplicate_group(
+        [ grep { !file_matches_exclude_regex($_->{name}, $opt) } @$dups ],
+        $opt,
+    );
+
+    my $keep_is_excluded = @eligible ? 0 : 1;
+    my $keep = @eligible ? shift @eligible : shift @excluded;
+
+    return {
+        keep             => $keep,
+        dels             => [ @eligible ],
+        excluded         => [ @excluded ],
+        keep_is_excluded => $keep_is_excluded,
+    };
+}
+
 sub priority_delete_rank {
     my ($name, $opt) = @_;
 
     return 0 unless defined $opt->{priority_delete};
     return file_matches_priority_delete($name, $opt->{priority_delete}) ? 1 : 0;
+}
+
+sub file_matches_exclude_regex {
+    my ($name, $opt) = @_;
+
+    return 0 unless defined $opt->{exclude_regex};
+    return $name =~ $opt->{exclude_regex} ? 1 : 0;
 }
 
 sub file_matches_priority_delete {
@@ -686,6 +755,14 @@ sub keep_rule_label {
     return defined $opt->{priority_delete}
         ? "$order / 優先削除='$opt->{priority_delete}'"
         : $order;
+}
+
+sub exclude_rule_label {
+    my ($opt) = @_;
+
+    return defined $opt->{exclude_regex_text}
+        ? "ファイル名 regex='$opt->{exclude_regex_text}'"
+        : "なし";
 }
 
 sub make_log_filename {
