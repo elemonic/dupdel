@@ -6,7 +6,7 @@ use FindBin;
 use lib $FindBin::Bin;
 
 use Digest::SHA;
-use Encode qw(decode);
+use Encode qw(decode encode FB_CROAK);
 use File::Spec;
 use WinConsoleJP qw(:default :rough);
 
@@ -33,7 +33,7 @@ sub init_platform {
 }
 
 sub main {
-    my $opt = parse_args(@ARGV);
+    my $opt = parse_args(decode_cli_args(@ARGV));
     my @target_dirs = $opt->{folder_mode}
         ? ($opt->{target_dir})
         : collect_target_dirs($opt->{target_dir}, $opt);
@@ -103,6 +103,30 @@ sub main {
         print_cp932("※ dry-run です。実際には削除していません。\n");
         print_cp932("  実際に削除するには --delete を付けて実行してください。\n");
     }
+}
+
+sub decode_cli_args {
+    my @args = @_;
+
+    return @args unless $IS_WINDOWS;
+    return map { decode_cli_arg($_) } @args;
+}
+
+sub decode_cli_arg {
+    my ($arg) = @_;
+
+    return $arg unless defined $arg;
+
+    if (utf8::is_utf8($arg)) {
+        return $arg unless $arg =~ /[\x{0080}-\x{00ff}]/;
+
+        my $bytes = eval { encode('latin-1', $arg, FB_CROAK) };
+        return $arg unless defined $bytes;
+
+        return eval { decode('cp932', $bytes, FB_CROAK) } // $arg;
+    }
+
+    return eval { decode('cp932', $arg, FB_CROAK) } // $arg;
 }
 
 sub parse_args {
