@@ -2,7 +2,7 @@
 
 `dupdel.pl` は、指定フォルダ内の重複ファイルを検出し、必要に応じて削除する Perl スクリプトです。
 
-重複判定は、ファイルサイズで絞り込んだあと SHA-1 ハッシュで行います。`--delete` を付けない場合は dry-run として動作し、実際には削除しません。
+重複判定は、ファイルサイズで絞り込んだあとハッシュで行います。デフォルトのハッシュ方式は sha256 です。`--delete` を付けない場合は dry-run として動作し、実際には削除しません。
 
 ## 使い方
 
@@ -11,6 +11,8 @@ perl dupdel.pl 対象フォルダ
 perl dupdel.pl --delete 対象フォルダ
 perl dupdel.pl -F 対象フォルダ
 perl dupdel.pl -F --delete 対象フォルダ
+perl dupdel.pl --hash sha256 対象フォルダ
+perl dupdel.pl -H sha1 対象フォルダ
 perl dupdel.pl -d N 対象フォルダ
 perl dupdel.pl -D N 対象フォルダ
 perl dupdel.pl -p STRING 対象フォルダ
@@ -25,6 +27,8 @@ perl dupdel.pl -D N -s 対象フォルダ
 ## オプション
 
 - `--delete`: 重複ファイルを実際に削除します。指定しない場合は dry-run です。
+- `--hash ALG`: 重複判定に使うハッシュ方式を指定します。`ALG` は `sha1` / `sha256` / `blake2` / `blake3` です。
+- `-H ALG`: `--hash ALG` の短縮指定です。
 - `-F`: 対象フォルダ直下の子フォルダ同士を比較し、完全一致している重複フォルダを検出します。
 - `-d N`: 基準フォルダから見てちょうど `N` 階層下の各フォルダを独立に処理します。`N=0` は葉フォルダのみです。
 - `-D N`: 1 階層下から `N` 階層下までの各フォルダを独立に処理します。`N=0` はすべてのサブフォルダです。
@@ -32,6 +36,22 @@ perl dupdel.pl -D N -s 対象フォルダ
 - `-p STRING`: `STRING` を含むファイルを削除側へ寄せます。正規表現ではなく文字列の部分一致です。
 - `-e REGEX`: ファイル名が `REGEX` にマッチするファイルを削除候補から除外します。判定対象はフルパスではなくファイル名のみです。
 - `-r`: ファイル名の逆順で keep を決めます。
+
+## ハッシュ方式
+
+ハッシュ方式のデフォルトは `sha256` です。
+
+```text
+perl dupdel.pl --hash sha256 対象フォルダ
+perl dupdel.pl --hash sha1 対象フォルダ
+perl dupdel.pl --hash blake2 対象フォルダ
+perl dupdel.pl --hash blake3 対象フォルダ
+perl dupdel.pl -H sha256 対象フォルダ
+```
+
+`sha1` と `sha256` は `Digest::SHA` を使います。`blake2` は CryptX の `Crypt::Digest` が利用できる環境で使えます。`blake3` は動作未確認扱いで、利用するには `Digest::BLAKE3` が必要です。
+
+必要なモジュールがない場合は、別の方式へ黙ってフォールバックせず、エラーで終了します。
 
 ## フォルダ重複削除
 

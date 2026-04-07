@@ -45,6 +45,7 @@ sub main {
     print_cp932("処理対象数     : " . scalar(@target_dirs) . "\n");
     print_cp932("keep選択       : " . keep_rule_label($opt) . "\n");
     print_cp932("削除除外       : " . exclude_rule_label($opt) . "\n");
+    print_cp932("ハッシュ方式   : $opt->{hash_alg}\n");
     print_cp932("OS判定         : " . ($IS_WINDOWS ? "Windows" : "非Windows") . "\n");
     if ($IS_WINDOWS) {
         print_cp932("列挙方式       : " . ($USE_LONGPATH ? "Win32::LongPath" : "標準") . "\n");
@@ -62,6 +63,7 @@ sub main {
         log_utf8($log_fh, "MODE: " . target_mode_label($opt) . "\n");
         log_utf8($log_fh, "TARGET_COUNT: " . scalar(@target_dirs) . "\n");
         log_utf8($log_fh, "KEEP_RULE: " . keep_rule_label($opt) . "\n");
+        log_utf8($log_fh, "HASH_ALG: $opt->{hash_alg}\n");
         log_utf8($log_fh, "EXCLUDE_RULE: " . exclude_rule_label($opt) . "\n\n");
     }
 
@@ -110,6 +112,7 @@ sub parse_args {
         do_delete    => 0,
         include_self => 0,
         reverse_keep => 0,
+        hash_alg     => 'sha256',
     );
 
     while (@args) {
@@ -126,6 +129,10 @@ sub parse_args {
         }
         elsif ($arg eq '-F') {
             $opt{folder_mode} = 1;
+        }
+        elsif ($arg eq '--hash' || $arg eq '-H') {
+            die usage() unless @args;
+            $opt{hash_alg} = normalize_hash_alg(shift @args);
         }
         elsif ($arg eq '-p') {
             die usage() unless @args;
@@ -154,6 +161,7 @@ sub parse_args {
     }
 
     die usage() unless defined $opt{target_dir};
+    $opt{hash_alg} = normalize_hash_alg($opt{hash_alg});
 
     if ($opt{folder_mode}) {
         die "エラー: -F と -d は同時に指定できません\n" if defined $opt{exact_depth};
@@ -166,6 +174,8 @@ sub parse_args {
         $opt{exclude_regex} = compile_exclude_regex($opt{exclude_regex_text});
     }
 
+    init_hash_algorithm($opt{hash_alg});
+
     my $exists = ($IS_WINDOWS && $USE_LONGPATH)
         ? testL('d', $opt{target_dir})
         : -d $opt{target_dir};
@@ -173,6 +183,43 @@ sub parse_args {
     die "エラー: フォルダが見つかりません: $opt{target_dir}\n" unless $exists;
 
     return \%opt;
+}
+
+sub normalize_hash_alg {
+    my ($alg) = @_;
+
+    die "エラー: --hash には sha1 / sha256 / blake2 / blake3 のいずれかを指定してください\n"
+        unless defined $alg && length $alg;
+
+    $alg = lc $alg;
+    die "エラー: 未対応のハッシュ方式です: $alg (指定可能: sha1 / sha256 / blake2 / blake3)\n"
+        unless $alg =~ /\A(?:sha1|sha256|blake2|blake3)\z/;
+
+    return $alg;
+}
+
+sub init_hash_algorithm {
+    my ($alg) = @_;
+
+    if ($alg eq 'sha1' || $alg eq 'sha256') {
+        return;
+    }
+
+    if ($alg eq 'blake2') {
+        eval {
+            require Crypt::Digest;
+            1;
+        } or die "エラー: blake2 を使うには CryptX の Crypt::Digest が必要です\n";
+        return;
+    }
+
+    if ($alg eq 'blake3') {
+        eval {
+            require Digest::BLAKE3;
+            1;
+        } or die "エラー: blake3 を使うには Digest::BLAKE3 が必要です\n";
+        return;
+    }
 }
 
 sub compile_exclude_regex {
@@ -204,6 +251,8 @@ sub usage {
   perl dupdel.pl --delete 対象フォルダ
   perl dupdel.pl -F 対象フォルダ
   perl dupdel.pl -F --delete 対象フォルダ
+  perl dupdel.pl --hash ALG 対象フォルダ
+  perl dupdel.pl -H ALG 対象フォルダ
   perl dupdel.pl -d N 対象フォルダ
   perl dupdel.pl -D N 対象フォルダ
   perl dupdel.pl -p STRING 対象フォルダ
@@ -217,6 +266,10 @@ sub usage {
 説明:
   --delete を付けない場合は dry-run です（削除しません）。
   指定フォルダ直下の通常ファイルのみを対象に、重複ファイルを検出します。
+  ハッシュ方式のデフォルトは sha256 です。
+  --hash ALG または -H ALG でハッシュ方式を指定できます。
+       ALG は sha1 / sha256 / blake2 / blake3 のいずれかです。
+       blake2 は CryptX の Crypt::Digest、blake3 は Digest::BLAKE3 が必要です。
   -F を付けると対象フォルダ直下の子フォルダ同士を比較し、完全一致した重複フォルダを検出します。
        フォルダ比較は直下ファイルのみを対象にし、サブフォルダを含む子フォルダはスキップします。
        実削除時は delete 側フォルダ内のファイルを削除し、空になった場合のみフォルダを削除します。
@@ -288,20 +341,20 @@ sub process_duplicates_in_dir {
         my $same_size_files = $by_size{$size};
         next if @$same_size_files < 2;
 
-        my %by_sha1;
+        my %by_hash;
         for my $f (@$same_size_files) {
-            my $sha1 = calc_sha1($f->{path});
-            if (!defined $sha1) {
+            my $hash = calc_file_hash($f->{path}, $opt);
+            if (!defined $hash) {
                 $result->{hash_error_count}++;
                 print_cp932("HASH失敗: $f->{name}\n");
                 log_utf8($log_fh, "HASH失敗: $f->{name}\n") if $do_delete;
                 next;
             }
-            push @{ $by_sha1{$sha1} }, $f;
+            push @{ $by_hash{$hash} }, $f;
         }
 
-        for my $sha1 (sort keys %by_sha1) {
-            my $dups = $by_sha1{$sha1};
+        for my $hash (sort keys %by_hash) {
+            my $dups = $by_hash{$hash};
             next if @$dups < 2;
 
             push @dup_groups, build_duplicate_group($dups, $opt);
@@ -418,7 +471,7 @@ sub process_duplicate_folders {
             next;
         }
 
-        my $signature = folder_signature($entry, $result, $log_fh, $do_delete);
+        my $signature = folder_signature($entry, $opt, $result, $log_fh, $do_delete);
         next unless defined $signature;
 
         push @{ $by_signature{$signature} }, $entry;
@@ -486,22 +539,22 @@ sub process_duplicate_folders {
 }
 
 sub folder_signature {
-    my ($entry, $result, $log_fh, $do_delete) = @_;
+    my ($entry, $opt, $result, $log_fh, $do_delete) = @_;
 
     my @files = collect_files($entry->{path});
     my @parts;
     my $total_size = 0;
 
     for my $file (@files) {
-        my $sha1 = calc_sha1($file->{path});
-        if (!defined $sha1) {
+        my $hash = calc_file_hash($file->{path}, $opt);
+        if (!defined $hash) {
             $result->{hash_error_count}++;
             print_cp932("HASH失敗: $entry->{name}/$file->{name}\n");
             log_utf8($log_fh, "HASH失敗: $entry->{name}/$file->{name}\n") if $do_delete;
             return undef;
         }
 
-        push @parts, join("\0", $file->{name}, $file->{size}, $sha1);
+        push @parts, join("\0", $file->{name}, $file->{size}, $hash);
         $total_size += $file->{size};
     }
 
@@ -915,8 +968,8 @@ sub collect_files_core {
     return sort { $a->{name} cmp $b->{name} } @files;
 }
 
-sub calc_sha1 {
-    my ($path) = @_;
+sub calc_file_hash {
+    my ($path, $opt) = @_;
 
     my $fh;
     my $ok;
@@ -930,11 +983,53 @@ sub calc_sha1 {
 
     return undef unless $ok;
 
-    my $sha = Digest::SHA->new(1);
-    $sha->addfile($fh);
+    my $digest = new_hash_context($opt->{hash_alg});
+    my $buffer = '';
+
+    while (1) {
+        my $read_len = read($fh, $buffer, 1024 * 1024);
+        if (!defined $read_len) {
+            close $fh;
+            return undef;
+        }
+        last if $read_len == 0;
+
+        $digest->add($buffer);
+    }
+
     close $fh;
 
-    return $sha->hexdigest;
+    return digest_to_hex($digest);
+}
+
+sub new_hash_context {
+    my ($alg) = @_;
+
+    if ($alg eq 'sha1') {
+        return Digest::SHA->new(1);
+    }
+    if ($alg eq 'sha256') {
+        return Digest::SHA->new(256);
+    }
+    if ($alg eq 'blake2') {
+        return Crypt::Digest->new('BLAKE2b_256');
+    }
+    if ($alg eq 'blake3') {
+        my $digest = Digest::BLAKE3::->new_hash();
+        $digest->hashsize(256) if $digest->can('hashsize');
+        return $digest;
+    }
+
+    die "エラー: 未対応のハッシュ方式です: $alg\n";
+}
+
+sub digest_to_hex {
+    my ($digest) = @_;
+
+    return $digest->hexdigest() if $digest->can('hexdigest');
+    return unpack('H*', $digest->digest()) if $digest->can('digest');
+
+    die "エラー: ハッシュ値を取り出せません\n";
 }
 
 sub delete_file {
