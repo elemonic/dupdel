@@ -77,7 +77,7 @@ sub main {
             log_folder_summary($log_fh, "合計件数", $result);
         }
         else {
-            log_utf8($log_fh, "合計件数: フォルダ=$result->{processed_dirs} / 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count}\n");
+            log_file_summary($log_fh, "合計件数", $result);
         }
         log_utf8($log_fh, "===== " . timestamp_for_log() . " END =====\n");
         close $log_fh;
@@ -89,13 +89,7 @@ sub main {
         print_folder_result($result);
     }
     else {
-        print_cp932("処理フォルダ数     : $result->{processed_dirs}\n");
-        print_cp932("対象ファイル数     : $result->{total_files}\n");
-        print_cp932("重複グループ数     : $result->{duplicate_groups}\n");
-        print_cp932("削除候補数         : $result->{delete_candidates}\n");
-        print_cp932("削除実行数         : $result->{deleted_count}\n");
-        print_cp932("削除失敗数         : $result->{delete_error_count}\n");
-        print_cp932("ハッシュ失敗数     : $result->{hash_error_count}\n");
+        print_file_result($result);
     }
 
     if (!$opt->{do_delete}) {
@@ -153,6 +147,9 @@ sub parse_args {
         }
         elsif ($arg eq '-F') {
             $opt{folder_mode} = 1;
+        }
+        elsif ($arg eq '--verbose' || $arg eq '-v') {
+            $opt{verbose} = 1;
         }
         elsif ($arg eq '--hash' || $arg eq '-H') {
             die usage() unless @args;
@@ -275,6 +272,8 @@ sub usage {
   perl dupdel.pl --delete 対象フォルダ
   perl dupdel.pl -F 対象フォルダ
   perl dupdel.pl -F --delete 対象フォルダ
+  perl dupdel.pl --verbose 対象フォルダ
+  perl dupdel.pl -v 対象フォルダ
   perl dupdel.pl --hash ALG 対象フォルダ
   perl dupdel.pl -H ALG 対象フォルダ
   perl dupdel.pl -d N 対象フォルダ
@@ -290,6 +289,7 @@ sub usage {
 説明:
   --delete を付けない場合は dry-run です（削除しません）。
   指定フォルダ直下の通常ファイルのみを対象に、重複ファイルを検出します。
+  --verbose または -v を付けると、複数フォルダ処理時に重複なしフォルダも画面表示します。
   ハッシュ方式のデフォルトは sha256 です。
   --hash ALG または -H ALG でハッシュ方式を指定できます。
        ALG は sha1 / sha256 / blake2 / blake3 のいずれかです。
@@ -332,6 +332,9 @@ sub process_target_dirs {
         $overall->{deleted_count}      += $result->{deleted_count};
         $overall->{delete_error_count} += $result->{delete_error_count};
         $overall->{hash_error_count}   += $result->{hash_error_count};
+        $overall->{delete_size_planned} += $result->{delete_size_planned};
+        $overall->{delete_size_done}    += $result->{delete_size_done};
+        $overall->{delete_size_failed}  += $result->{delete_size_failed};
         push @{ $overall->{delete_failures} }, @{ $result->{delete_failures} };
     }
 
@@ -345,10 +348,6 @@ sub process_duplicates_in_dir {
     my $result = empty_result();
     my @files = collect_files($dir);
     $result->{total_files} = scalar @files;
-
-    if ($show_dir_header) {
-        print_cp932("===== $dir =====\n");
-    }
 
     if ($do_delete) {
         log_utf8($log_fh, "TARGET_DIR: $dir\n");
@@ -388,14 +387,19 @@ sub process_duplicates_in_dir {
     @dup_groups = sort { $a->{keep}{name} cmp $b->{keep}{name} } @dup_groups;
 
     if (!@dup_groups) {
-        if ($show_dir_header) {
+        if ($show_dir_header && $opt->{verbose}) {
+            print_cp932("===== $dir =====\n");
             print_cp932("(重複なし)\n\n");
         }
         if ($do_delete) {
             log_utf8($log_fh, "(重複なし)\n");
-            log_utf8($log_fh, "件数: 対象=$result->{total_files} / 重複組=0 / 削除候補=0 / 削除成功=0 / 削除失敗=0 / HASH失敗=$result->{hash_error_count}\n\n");
+            log_file_summary($log_fh, "件数", $result);
         }
         return $result;
+    }
+
+    if ($show_dir_header) {
+        print_cp932("===== $dir =====\n");
     }
 
     for my $group (@dup_groups) {
@@ -405,6 +409,7 @@ sub process_duplicates_in_dir {
 
         $result->{duplicate_groups}++;
         $result->{delete_candidates} += scalar @sorted;
+        $result->{delete_size_planned} += $_->{size} for @sorted;
 
         if ($group->{keep_is_excluded}) {
             print_cp932("除外: $keep->{name}\n");
@@ -433,12 +438,14 @@ sub process_duplicates_in_dir {
 
                 if ($ok) {
                     $result->{deleted_count}++;
+                    $result->{delete_size_done} += $del->{size};
                     log_utf8($log_fh, "-> $del->{name}\n");
                 }
                 else {
                     my $error_message = $!;
                     my $failed_at = timestamp_for_log();
                     $result->{delete_error_count}++;
+                    $result->{delete_size_failed} += $del->{size};
                     push @{ $result->{delete_failures} }, {
                         target_dir => $dir,
                         keep_name  => $keep->{name},
@@ -460,7 +467,7 @@ sub process_duplicates_in_dir {
     }
 
     if ($do_delete) {
-        log_utf8($log_fh, "件数: 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count}\n\n");
+        log_file_summary($log_fh, "件数", $result);
     }
 
     return $result;
@@ -1124,6 +1131,21 @@ sub log_delete_failures_summary {
     log_utf8($log_fh, "\n");
 }
 
+sub print_file_result {
+    my ($result) = @_;
+
+    print_cp932("処理フォルダ数     : $result->{processed_dirs}\n");
+    print_cp932("対象ファイル数     : $result->{total_files}\n");
+    print_cp932("重複グループ数     : $result->{duplicate_groups}\n");
+    print_cp932("削除候補数         : $result->{delete_candidates}\n");
+    print_cp932("削除実行数         : $result->{deleted_count}\n");
+    print_cp932("削除失敗数         : $result->{delete_error_count}\n");
+    print_cp932("ハッシュ失敗数     : $result->{hash_error_count}\n");
+    print_cp932("削除予定サイズ合計 : $result->{delete_size_planned} bytes\n");
+    print_cp932("実削除サイズ合計   : $result->{delete_size_done} bytes\n");
+    print_cp932("削除失敗サイズ合計 : $result->{delete_size_failed} bytes\n");
+}
+
 sub print_folder_result {
     my ($result) = @_;
 
@@ -1139,6 +1161,14 @@ sub print_folder_result {
     print_cp932("削除予定サイズ合計     : $result->{delete_size_planned} bytes\n");
     print_cp932("実削除サイズ合計       : $result->{delete_size_done} bytes\n");
     print_cp932("削除失敗サイズ合計     : $result->{delete_size_failed} bytes\n");
+}
+
+sub log_file_summary {
+    my ($log_fh, $label, $result) = @_;
+
+    return unless $log_fh;
+
+    log_utf8($log_fh, "$label: 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count} / 削除予定サイズ=$result->{delete_size_planned} bytes / 実削除サイズ=$result->{delete_size_done} bytes / 削除失敗サイズ=$result->{delete_size_failed} bytes\n\n");
 }
 
 sub log_folder_summary {

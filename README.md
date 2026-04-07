@@ -11,6 +11,8 @@ perl dupdel.pl 対象フォルダ
 perl dupdel.pl --delete 対象フォルダ
 perl dupdel.pl -F 対象フォルダ
 perl dupdel.pl -F --delete 対象フォルダ
+perl dupdel.pl --verbose 対象フォルダ
+perl dupdel.pl -v 対象フォルダ
 perl dupdel.pl --hash sha256 対象フォルダ
 perl dupdel.pl -H sha1 対象フォルダ
 perl dupdel.pl -d N 対象フォルダ
@@ -27,6 +29,8 @@ perl dupdel.pl -D N -s 対象フォルダ
 ## オプション
 
 - `--delete`: 重複ファイルを実際に削除します。指定しない場合は dry-run です。
+- `--verbose`: 複数フォルダ処理時に、重複なしフォルダも画面表示します。ログの詳細度は変えません。
+- `-v`: `--verbose` の短縮指定です。
 - `--hash ALG`: 重複判定に使うハッシュ方式を指定します。`ALG` は `sha1` / `sha256` / `blake2` / `blake3` です。
 - `-H ALG`: `--hash ALG` の短縮指定です。
 - `-F`: 対象フォルダ直下の子フォルダ同士を比較し、完全一致している重複フォルダを検出します。
@@ -52,6 +56,12 @@ perl dupdel.pl -H sha256 対象フォルダ
 `sha1` と `sha256` は `Digest::SHA` を使います。`blake2` は CryptX の `Crypt::Digest` が利用できる環境で使えます。`blake3` は動作未確認扱いで、利用するには `Digest::BLAKE3` が必要です。
 
 必要なモジュールがない場合は、別の方式へ黙ってフォールバックせず、エラーで終了します。
+
+## 表示とサイズ集計
+
+通常のファイル重複モードでも、削除予定サイズ合計、実削除サイズ合計、削除失敗サイズ合計を bytes で表示します。dry-run 時も削除予定サイズ合計を表示します。
+
+複数フォルダを処理する場合、通常時は重複があるフォルダだけを画面表示します。`--verbose` または `-v` を付けた場合のみ、重複なしフォルダと `(重複なし)` も画面表示します。
 
 ## フォルダ重複削除
 
