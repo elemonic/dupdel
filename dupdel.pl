@@ -34,7 +34,9 @@ sub init_platform {
 
 sub main {
     my $opt = parse_args(@ARGV);
-    my @target_dirs = collect_target_dirs($opt->{target_dir}, $opt);
+    my @target_dirs = $opt->{folder_mode}
+        ? ($opt->{target_dir})
+        : collect_target_dirs($opt->{target_dir}, $opt);
     my $log_file = make_log_filename();
 
     print_cp932("モード         : " . ($opt->{do_delete} ? "実削除" : "dry-run") . "\n");
@@ -63,24 +65,36 @@ sub main {
         log_utf8($log_fh, "EXCLUDE_RULE: " . exclude_rule_label($opt) . "\n\n");
     }
 
-    my $result = process_target_dirs(\@target_dirs, $opt, $log_fh);
+    my $result = $opt->{folder_mode}
+        ? process_duplicate_folders($opt->{target_dir}, $opt, $log_fh)
+        : process_target_dirs(\@target_dirs, $opt, $log_fh);
 
     if ($opt->{do_delete}) {
         log_delete_failures_summary($log_fh, $result->{delete_failures});
-        log_utf8($log_fh, "合計件数: フォルダ=$result->{processed_dirs} / 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count}\n");
+        if ($opt->{folder_mode}) {
+            log_folder_summary($log_fh, "合計件数", $result);
+        }
+        else {
+            log_utf8($log_fh, "合計件数: フォルダ=$result->{processed_dirs} / 対象=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補=$result->{delete_candidates} / 削除成功=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / HASH失敗=$result->{hash_error_count}\n");
+        }
         log_utf8($log_fh, "===== " . timestamp_for_log() . " END =====\n");
         close $log_fh;
     }
 
     print_cp932("\n");
     print_cp932("===== 実行結果 =====\n");
-    print_cp932("処理フォルダ数     : $result->{processed_dirs}\n");
-    print_cp932("対象ファイル数     : $result->{total_files}\n");
-    print_cp932("重複グループ数     : $result->{duplicate_groups}\n");
-    print_cp932("削除候補数         : $result->{delete_candidates}\n");
-    print_cp932("削除実行数         : $result->{deleted_count}\n");
-    print_cp932("削除失敗数         : $result->{delete_error_count}\n");
-    print_cp932("ハッシュ失敗数     : $result->{hash_error_count}\n");
+    if ($opt->{folder_mode}) {
+        print_folder_result($result);
+    }
+    else {
+        print_cp932("処理フォルダ数     : $result->{processed_dirs}\n");
+        print_cp932("対象ファイル数     : $result->{total_files}\n");
+        print_cp932("重複グループ数     : $result->{duplicate_groups}\n");
+        print_cp932("削除候補数         : $result->{delete_candidates}\n");
+        print_cp932("削除実行数         : $result->{deleted_count}\n");
+        print_cp932("削除失敗数         : $result->{delete_error_count}\n");
+        print_cp932("ハッシュ失敗数     : $result->{hash_error_count}\n");
+    }
 
     if (!$opt->{do_delete}) {
         print_cp932("\n");
@@ -110,6 +124,9 @@ sub parse_args {
         elsif ($arg eq '-r') {
             $opt{reverse_keep} = 1;
         }
+        elsif ($arg eq '-F') {
+            $opt{folder_mode} = 1;
+        }
         elsif ($arg eq '-p') {
             die usage() unless @args;
             $opt{priority_delete} = shift @args;
@@ -137,6 +154,13 @@ sub parse_args {
     }
 
     die usage() unless defined $opt{target_dir};
+
+    if ($opt{folder_mode}) {
+        die "エラー: -F と -d は同時に指定できません\n" if defined $opt{exact_depth};
+        die "エラー: -F と -D は同時に指定できません\n" if defined $opt{max_depth};
+        die "エラー: -F と -s は同時に指定できません\n" if $opt{include_self};
+        die "エラー: -F と -p は同時に指定できません\n" if defined $opt{priority_delete};
+    }
 
     if (defined $opt{exclude_regex_text}) {
         $opt{exclude_regex} = compile_exclude_regex($opt{exclude_regex_text});
@@ -178,6 +202,8 @@ sub usage {
 使い方:
   perl dupdel.pl 対象フォルダ
   perl dupdel.pl --delete 対象フォルダ
+  perl dupdel.pl -F 対象フォルダ
+  perl dupdel.pl -F --delete 対象フォルダ
   perl dupdel.pl -d N 対象フォルダ
   perl dupdel.pl -D N 対象フォルダ
   perl dupdel.pl -p STRING 対象フォルダ
@@ -191,6 +217,9 @@ sub usage {
 説明:
   --delete を付けない場合は dry-run です（削除しません）。
   指定フォルダ直下の通常ファイルのみを対象に、重複ファイルを検出します。
+  -F を付けると対象フォルダ直下の子フォルダ同士を比較し、完全一致した重複フォルダを検出します。
+       フォルダ比較は直下ファイルのみを対象にし、サブフォルダを含む子フォルダはスキップします。
+       実削除時は delete 側フォルダ内のファイルを削除し、空になった場合のみフォルダを削除します。
   -d N はちょうど N 階層下の各フォルダを独立に処理します。
        N=0 のときは葉フォルダのみを処理します。
   -D N は 1 階層下から N 階層下までの各フォルダを独立に処理します。
@@ -358,6 +387,262 @@ sub process_duplicates_in_dir {
     }
 
     return $result;
+}
+
+sub process_duplicate_folders {
+    my ($base_dir, $opt, $log_fh) = @_;
+    my $do_delete = $opt->{do_delete};
+
+    my $result = empty_result();
+    $result->{processed_dirs} = 1;
+
+    log_utf8($log_fh, "TARGET_DIR: $base_dir\n") if $do_delete;
+
+    my @child_dirs = map {
+        {
+            name => path_basename($_),
+            path => $_,
+        }
+    } collect_subdirs($base_dir);
+
+    $result->{target_dirs} = scalar @child_dirs;
+
+    my %by_signature;
+
+    for my $entry (@child_dirs) {
+        my @subdirs = collect_subdirs($entry->{path});
+        if (@subdirs) {
+            $result->{skipped_subdir_dirs}++;
+            print_cp932("スキップ: $entry->{name} (サブフォルダを含むためスキップ)\n");
+            log_utf8($log_fh, "スキップ: $entry->{name} (サブフォルダを含むためスキップ)\n") if $do_delete;
+            next;
+        }
+
+        my $signature = folder_signature($entry, $result, $log_fh, $do_delete);
+        next unless defined $signature;
+
+        push @{ $by_signature{$signature} }, $entry;
+    }
+
+    my @dup_groups;
+    for my $signature (sort keys %by_signature) {
+        my $entries = $by_signature{$signature};
+        next if @$entries < 2;
+
+        my @sorted = sort_folder_entries($entries, $opt);
+        my $keep = shift @sorted;
+
+        push @dup_groups, {
+            keep => $keep,
+            dels => [ @sorted ],
+        };
+    }
+
+    @dup_groups = sort { $a->{keep}{name} cmp $b->{keep}{name} } @dup_groups;
+
+    if (!@dup_groups) {
+        print_cp932("(重複フォルダなし)\n");
+        log_utf8($log_fh, "(重複フォルダなし)\n") if $do_delete;
+        return $result;
+    }
+
+    for my $group (@dup_groups) {
+        my $keep = $group->{keep};
+        my @dels = @{ $group->{dels} };
+        my $has_exclude = folder_group_has_excluded_file($group, $opt);
+        my $delete_size = 0;
+        $delete_size += $_->{total_size} for @dels;
+
+        $result->{duplicate_groups}++;
+
+        print_cp932("$keep->{name}\n");
+        log_utf8($log_fh, "$keep->{name}\n") if $do_delete;
+
+        for my $del (@dels) {
+            print_cp932("-> $del->{name} ($del->{total_size} bytes)\n");
+            log_utf8($log_fh, "-> $del->{name} ($del->{total_size} bytes)\n") if $do_delete;
+        }
+
+        if ($has_exclude) {
+            $result->{skipped_exclude_groups}++;
+            print_cp932("削除スキップ: 除外 regex にマッチするファイルを含むため、フォルダグループ全体をスキップ\n\n");
+            log_utf8($log_fh, "削除スキップ: 除外 regex にマッチするファイルを含むため、フォルダグループ全体をスキップ\n\n") if $do_delete;
+            next;
+        }
+
+        $result->{delete_candidates} += scalar @dels;
+        $result->{delete_size_planned} += $delete_size;
+        print_cp932("削除予定サイズ: $delete_size bytes\n\n");
+        log_utf8($log_fh, "削除予定サイズ: $delete_size bytes\n\n") if $do_delete;
+
+        next unless $do_delete;
+
+        for my $del (@dels) {
+            delete_duplicate_folder_entry($keep, $del, $result, $log_fh);
+        }
+    }
+
+    return $result;
+}
+
+sub folder_signature {
+    my ($entry, $result, $log_fh, $do_delete) = @_;
+
+    my @files = collect_files($entry->{path});
+    my @parts;
+    my $total_size = 0;
+
+    for my $file (@files) {
+        my $sha1 = calc_sha1($file->{path});
+        if (!defined $sha1) {
+            $result->{hash_error_count}++;
+            print_cp932("HASH失敗: $entry->{name}/$file->{name}\n");
+            log_utf8($log_fh, "HASH失敗: $entry->{name}/$file->{name}\n") if $do_delete;
+            return undef;
+        }
+
+        push @parts, join("\0", $file->{name}, $file->{size}, $sha1);
+        $total_size += $file->{size};
+    }
+
+    $entry->{files} = [ @files ];
+    $entry->{total_size} = $total_size;
+    $result->{total_files} += scalar @files;
+
+    return join("\0\0", sort @parts);
+}
+
+sub sort_folder_entries {
+    my ($entries, $opt) = @_;
+
+    return sort {
+        $opt->{reverse_keep}
+            ? ($b->{name} cmp $a->{name})
+            : ($a->{name} cmp $b->{name})
+    } @$entries;
+}
+
+sub folder_group_has_excluded_file {
+    my ($group, $opt) = @_;
+
+    return 0 unless defined $opt->{exclude_regex};
+
+    for my $entry ($group->{keep}, @{ $group->{dels} }) {
+        for my $file (@{ $entry->{files} }) {
+            return 1 if file_matches_exclude_regex($file->{name}, $opt);
+        }
+    }
+
+    return 0;
+}
+
+sub delete_duplicate_folder_entry {
+    my ($keep, $del, $result, $log_fh) = @_;
+
+    for my $file (@{ $del->{files} }) {
+        my $ok = delete_file($file->{path});
+        if ($ok) {
+            $result->{delete_size_done} += $file->{size};
+            log_utf8($log_fh, "   file deleted: $file->{name} ($file->{size} bytes)\n");
+        }
+        else {
+            my $error_message = $!;
+            my $failed_at = timestamp_for_log();
+            $result->{delete_error_count}++;
+            $result->{delete_size_failed} += $file->{size};
+            push @{ $result->{delete_failures} }, {
+                target_dir => $del->{path},
+                keep_name  => $keep->{name},
+                delete_name => "$del->{name}/$file->{name}",
+                error      => $error_message,
+                failed_at  => $failed_at,
+            };
+            warn_cp932("削除失敗: keep=$keep->{name} / delete=$del->{name}/$file->{name} : $error_message\n");
+            log_utf8($log_fh, "   file delete failed: $file->{name} ($error_message)\n");
+        }
+    }
+
+    if (!dir_is_empty($del->{path})) {
+        my $error_message = "フォルダが空ではありません";
+        my $failed_at = timestamp_for_log();
+        $result->{delete_error_count}++;
+        push @{ $result->{delete_failures} }, {
+            target_dir => $del->{path},
+            keep_name  => $keep->{name},
+            delete_name => $del->{name},
+            error      => $error_message,
+            failed_at  => $failed_at,
+        };
+        warn_cp932("フォルダ削除スキップ: $del->{name} ($error_message)\n");
+        log_utf8($log_fh, "   folder delete skipped: $error_message\n");
+        return;
+    }
+
+    my $ok = remove_empty_dir($del->{path});
+    if ($ok) {
+        $result->{deleted_count}++;
+        log_utf8($log_fh, "   folder deleted: $del->{name}\n");
+    }
+    else {
+        my $error_message = $!;
+        my $failed_at = timestamp_for_log();
+        $result->{delete_error_count}++;
+        push @{ $result->{delete_failures} }, {
+            target_dir => $del->{path},
+            keep_name  => $keep->{name},
+            delete_name => $del->{name},
+            error      => $error_message,
+            failed_at  => $failed_at,
+        };
+        warn_cp932("フォルダ削除失敗: keep=$keep->{name} / delete=$del->{name} : $error_message\n");
+        log_utf8($log_fh, "   folder delete failed: $error_message\n");
+    }
+}
+
+sub dir_is_empty {
+    my ($dir) = @_;
+
+    if ($IS_WINDOWS && $USE_LONGPATH) {
+        return dir_is_empty_longpath($dir);
+    }
+    else {
+        return dir_is_empty_core($dir);
+    }
+}
+
+sub dir_is_empty_longpath {
+    my ($dir) = @_;
+
+    my $dh = Win32::LongPath->new();
+    $dh->opendirL($dir) or return 0;
+
+    for my $name ($dh->readdirL()) {
+        next if $name eq '.';
+        next if $name eq '..';
+
+        $dh->closedirL();
+        return 0;
+    }
+
+    $dh->closedirL();
+    return 1;
+}
+
+sub dir_is_empty_core {
+    my ($dir) = @_;
+
+    opendir my $dh, $dir or return 0;
+
+    while (my $name = readdir $dh) {
+        next if $name eq '.';
+        next if $name eq '..';
+
+        closedir $dh;
+        return 0;
+    }
+
+    closedir $dh;
+    return 1;
 }
 
 sub collect_target_dirs {
@@ -663,15 +948,40 @@ sub delete_file {
     }
 }
 
+sub remove_empty_dir {
+    my ($path) = @_;
+
+    if ($IS_WINDOWS && $USE_LONGPATH) {
+        return rmdirL($path);
+    }
+    else {
+        return rmdir($path);
+    }
+}
+
+sub path_basename {
+    my ($path) = @_;
+
+    my @parts = File::Spec->splitdir($path);
+    pop @parts while @parts && $parts[-1] eq '';
+    return @parts ? $parts[-1] : $path;
+}
+
 sub empty_result {
     return {
         processed_dirs      => 0,
+        target_dirs         => 0,
         total_files         => 0,
         duplicate_groups    => 0,
         delete_candidates   => 0,
         deleted_count       => 0,
         delete_error_count  => 0,
         hash_error_count    => 0,
+        skipped_subdir_dirs => 0,
+        skipped_exclude_groups => 0,
+        delete_size_planned => 0,
+        delete_size_done    => 0,
+        delete_size_failed  => 0,
         delete_failures     => [],
     };
 }
@@ -693,6 +1003,31 @@ sub log_delete_failures_summary {
     }
 
     log_utf8($log_fh, "\n");
+}
+
+sub print_folder_result {
+    my ($result) = @_;
+
+    print_cp932("比較対象候補フォルダ数 : $result->{target_dirs}\n");
+    print_cp932("対象ファイル数         : $result->{total_files}\n");
+    print_cp932("重複フォルダグループ数 : $result->{duplicate_groups}\n");
+    print_cp932("削除候補フォルダ数     : $result->{delete_candidates}\n");
+    print_cp932("削除実行フォルダ数     : $result->{deleted_count}\n");
+    print_cp932("削除失敗数             : $result->{delete_error_count}\n");
+    print_cp932("サブフォルダskip数     : $result->{skipped_subdir_dirs}\n");
+    print_cp932("除外skipグループ数     : $result->{skipped_exclude_groups}\n");
+    print_cp932("ハッシュ失敗数         : $result->{hash_error_count}\n");
+    print_cp932("削除予定サイズ合計     : $result->{delete_size_planned} bytes\n");
+    print_cp932("実削除サイズ合計       : $result->{delete_size_done} bytes\n");
+    print_cp932("削除失敗サイズ合計     : $result->{delete_size_failed} bytes\n");
+}
+
+sub log_folder_summary {
+    my ($log_fh, $label, $result) = @_;
+
+    return unless $log_fh;
+
+    log_utf8($log_fh, "$label: 対象フォルダ=$result->{target_dirs} / 対象ファイル=$result->{total_files} / 重複組=$result->{duplicate_groups} / 削除候補フォルダ=$result->{delete_candidates} / 削除成功フォルダ=$result->{deleted_count} / 削除失敗=$result->{delete_error_count} / サブフォルダskip=$result->{skipped_subdir_dirs} / 除外skip=$result->{skipped_exclude_groups} / HASH失敗=$result->{hash_error_count} / 削除予定サイズ=$result->{delete_size_planned} bytes / 実削除サイズ=$result->{delete_size_done} bytes / 削除失敗サイズ=$result->{delete_size_failed} bytes\n\n");
 }
 
 sub open_log_file {
@@ -722,6 +1057,10 @@ sub to_log_text {
 
 sub target_mode_label {
     my ($opt) = @_;
+
+    if ($opt->{folder_mode}) {
+        return "直下子フォルダ重複比較";
+    }
 
     if (defined $opt->{exact_depth}) {
         if ($opt->{exact_depth} == 0) {
